@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+UNATTENDED="${UNATTENDED:-0}"
+TIMEZONE="${TIMEZONE:-Europe/Rome}"
+ENABLE_ROOT_SSH_PASSWORD="${ENABLE_ROOT_SSH_PASSWORD:-1}"
+POSTGRES_VERSION="${POSTGRES_VERSION:-${PG_VERSION:-}}"
+POSTGRES_DATA_DIR="${POSTGRES_DATA_DIR:-${DATA_DIR:-}}"
+
 # Verifica che lo script venga eseguito come root
 if [ "$EUID" -ne 0 ]; then
   echo "Errore: Lo script deve essere eseguito come root"
@@ -9,6 +15,10 @@ fi
 
 # Funzione per mostrare un messaggio informativo
 show_info() {
+  if [ "$UNATTENDED" = "1" ] || [ ! -t 1 ] || ! command -v whiptail >/dev/null 2>&1; then
+    echo "[$1] $2"
+    return
+  fi
   whiptail --title "$1" --infobox "$2" 6 80
   sleep 1.5
 }
@@ -17,6 +27,9 @@ show_info() {
 show_error() {
   local message="$1"
   echo "$message" >&2
+  if [ "$UNATTENDED" = "1" ] || [ ! -t 1 ] || ! command -v whiptail >/dev/null 2>&1; then
+    exit 1
+  fi
   whiptail --title "Errore Critico" --msgbox "$message" 20 80 1
   exit 1
 }
@@ -42,8 +55,42 @@ ensure_pg_hba_line() {
   grep -Fqx "$line" "$file" || echo "$line" >> "$file"
 }
 
+configure_timezone_and_ssh() {
+  show_info "Sistema" "Configurazione timezone ${TIMEZONE} e accesso SSH root/password..."
+  if [ -f "/usr/share/zoneinfo/${TIMEZONE}" ]; then
+    ln -snf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+    echo "${TIMEZONE}" > /etc/timezone
+    timedatectl set-timezone "${TIMEZONE}" >/dev/null 2>&1 || true
+  fi
+
+  if [ "${ENABLE_ROOT_SSH_PASSWORD}" = "1" ] && [ -f /etc/ssh/sshd_config ]; then
+    if grep -Eq '^[#[:space:]]*PermitRootLogin[[:space:]]+' /etc/ssh/sshd_config; then
+      sed -ri 's|^[#[:space:]]*PermitRootLogin[[:space:]]+.*|PermitRootLogin yes|' /etc/ssh/sshd_config
+    else
+      echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+    fi
+    if grep -Eq '^[#[:space:]]*PasswordAuthentication[[:space:]]+' /etc/ssh/sshd_config; then
+      sed -ri 's|^[#[:space:]]*PasswordAuthentication[[:space:]]+.*|PasswordAuthentication yes|' /etc/ssh/sshd_config
+    else
+      echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+    fi
+    systemctl enable ssh >/dev/null 2>&1 || systemctl enable sshd >/dev/null 2>&1 || true
+    systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
+  fi
+}
+
 # Funzione per ottenere la versione di PostgreSQL da installare
 get_postgres_version() {
+  if [ -n "${POSTGRES_VERSION}" ]; then
+    case "${POSTGRES_VERSION}" in
+      16|18) echo "${POSTGRES_VERSION}"; return ;;
+      *) show_error "POSTGRES_VERSION deve essere 16 o 18." ;;
+    esac
+  fi
+  if [ "$UNATTENDED" = "1" ] || [ ! -t 1 ]; then
+    echo "16"
+    return
+  fi
   local PG_VERSION
   PG_VERSION=$(whiptail --title "Versione PostgreSQL" --menu \
     "Seleziona la versione di PostgreSQL da installare:" 20 80 10 \
@@ -64,6 +111,11 @@ get_postgres_datadir() {
   local alt_dir="/metriks/PostgreSQL/${version}/data"
   local DATA_DIR
 
+  if [ -n "${POSTGRES_DATA_DIR}" ]; then
+    DATA_DIR="${POSTGRES_DATA_DIR}"
+  elif [ "$UNATTENDED" = "1" ] || [ ! -t 1 ]; then
+    DATA_DIR="${default_dir}"
+  else
   DATA_DIR=$(whiptail --title "Data Directory PostgreSQL" --inputbox \
 "Inserisci il data directory COMPLETO per PostgreSQL ${version}.
 
@@ -78,6 +130,7 @@ Nota:
 
   if [ $? -ne 0 ]; then
     show_error "Installazione annullata dall'utente durante la scelta del data directory."
+  fi
   fi
 
   DATA_DIR="$(echo "$DATA_DIR" | xargs)"
@@ -135,7 +188,8 @@ main() {
   # 2. Installazione pacchetti necessari
   show_info "Installazione Pacchetti" "Installazione dei pacchetti richiesti..."
   apt update -y > /dev/null 2>&1 || show_error "Aggiornamento del sistema fallito"
-  apt install -y sudo rsync curl gnupg cron lsb-release gzip cloud-utils postgresql-common postgresql-client-common > /dev/null 2>&1 || show_error "Installazione pacchetti di base fallita"
+  apt install -y sudo rsync curl gnupg cron lsb-release gzip cloud-utils postgresql-common postgresql-client-common tzdata openssh-server > /dev/null 2>&1 || show_error "Installazione pacchetti di base fallita"
+  configure_timezone_and_ssh
 
   # 3. Aggiunta repository PostgreSQL ufficiale
   show_info "Repository PostgreSQL" "Aggiunta del repository ufficiale..."
@@ -450,7 +504,9 @@ EOF
 
   # 18. Messaggio finale
   show_info "Completato" "Configurazione completata con successo!"
-  whiptail --title "Completato" --msgbox "Configurazione completata con successo!\n\nPostgreSQL ${PG_VERSION} è stato configurato e avviato.\n\nData directory:\n${DATA_DIR}\n\nGli script:\n- rename-vg (richiamabile con 'rename-vg')\n- expand-disk (richiamabile con 'expand-disk')\nsono stati installati in /etc e resi eseguibili globalmente.\n\nIl backup giornaliero è stato programmato in /etc/crontab e verrà eseguito ogni giorno alle 04:30.\nCartella backup:\n${BACKUP_DIR}" 22 90 1
+  if [ "$UNATTENDED" != "1" ] && [ -t 1 ] && command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "Completato" --msgbox "Configurazione completata con successo!\n\nPostgreSQL ${PG_VERSION} è stato configurato e avviato.\n\nData directory:\n${DATA_DIR}\n\nGli script:\n- rename-vg (richiamabile con 'rename-vg')\n- expand-disk (richiamabile con 'expand-disk')\nsono stati installati in /etc e resi eseguibili globalmente.\n\nIl backup giornaliero è stato programmato in /etc/crontab e verrà eseguito ogni giorno alle 04:30.\nCartella backup:\n${BACKUP_DIR}" 22 90 1
+  fi
 }
 
 # Esecuzione principale
