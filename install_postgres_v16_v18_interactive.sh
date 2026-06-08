@@ -79,6 +79,30 @@ configure_timezone_and_ssh() {
   fi
 }
 
+# Imposta la lingua di sistema della VM su Italiano (it_IT.UTF-8) e genera il
+# locale, che servira' anche come collate/ctype del cluster PostgreSQL.
+configure_locale() {
+  show_info "Lingua Sistema" "Configurazione lingua VM su Italiano (it_IT.UTF-8)..."
+
+  # Assicura che il pacchetto locales sia presente (su immagini minime manca)
+  command -v locale-gen >/dev/null 2>&1 || apt install -y locales > /dev/null 2>&1 || show_error "Installazione pacchetto locales fallita"
+
+  # Abilita it_IT.UTF-8 in /etc/locale.gen (decommenta o aggiunge)
+  if [ -f /etc/locale.gen ] && grep -Eq '^[#[:space:]]*it_IT\.UTF-8[[:space:]]+UTF-8' /etc/locale.gen; then
+    sed -ri 's|^[#[:space:]]*(it_IT\.UTF-8[[:space:]]+UTF-8)|\1|' /etc/locale.gen
+  else
+    echo 'it_IT.UTF-8 UTF-8' >> /etc/locale.gen
+  fi
+
+  locale-gen > /dev/null 2>&1 || show_error "Generazione del locale it_IT.UTF-8 fallita"
+
+  # Imposta la lingua di default del sistema (persistente)
+  update-locale LANG=it_IT.UTF-8 LANGUAGE=it_IT:it > /dev/null 2>&1 || true
+
+  # Esporta per la sessione corrente cosi' i cluster creati ora ereditano la locale
+  export LANG=it_IT.UTF-8 LANGUAGE=it_IT:it LC_ALL=it_IT.UTF-8
+}
+
 # Funzione per ottenere la versione di PostgreSQL da installare
 get_postgres_version() {
   if [ -n "${POSTGRES_VERSION}" ]; then
@@ -188,8 +212,9 @@ main() {
   # 2. Installazione pacchetti necessari
   show_info "Installazione Pacchetti" "Installazione dei pacchetti richiesti..."
   apt update -y > /dev/null 2>&1 || show_error "Aggiornamento del sistema fallito"
-  apt install -y sudo rsync curl gnupg cron lsb-release gzip cloud-utils postgresql-common postgresql-client-common tzdata openssh-server > /dev/null 2>&1 || show_error "Installazione pacchetti di base fallita"
+  apt install -y sudo rsync curl gnupg cron lsb-release gzip cloud-utils ncdu locales postgresql-common postgresql-client-common tzdata openssh-server > /dev/null 2>&1 || show_error "Installazione pacchetti di base fallita"
   configure_timezone_and_ssh
+  configure_locale
 
   # 3. Aggiunta repository PostgreSQL ufficiale
   show_info "Repository PostgreSQL" "Aggiunta del repository ufficiale..."
@@ -207,11 +232,13 @@ main() {
   apt install -y postgresql-${PG_VERSION} > /dev/null 2>&1 || show_error "Installazione di PostgreSQL ${PG_VERSION} fallita"
   systemctl enable postgresql > /dev/null 2>&1 || true
 
-  # Se il cluster non viene creato automaticamente, lo crea manualmente
-  if [ ! -d "${CONF_DIR}" ]; then
-    show_info "Creazione Cluster" "Il cluster non esiste ancora. Creazione cluster main..."
-    pg_createcluster "${PG_VERSION}" main > /dev/null 2>&1 || show_error "Creazione del cluster ${PG_VERSION}/main fallita"
-  fi
+  # Forza la locale italiana sul cluster: collate/ctype = it_IT.UTF-8.
+  # L'installazione del pacchetto crea un cluster "main" con la locale di
+  # sistema; su installazione pulita (nessun dato) lo rimuoviamo e ricreiamo
+  # esplicitamente in italiano per garantire collate/ctype corretti.
+  show_info "Locale Cluster" "Impostazione collate/ctype del cluster su it_IT.UTF-8..."
+  pg_dropcluster "${PG_VERSION}" main --stop > /dev/null 2>&1 || true
+  pg_createcluster --locale it_IT.UTF-8 "${PG_VERSION}" main > /dev/null 2>&1 || show_error "Creazione del cluster ${PG_VERSION}/main (it_IT.UTF-8) fallita"
 
   # 5. Fermare tutti i processi di PostgreSQL
   show_info "Ferma Processi" "Arresto forzato dei processi PostgreSQL..."
@@ -245,7 +272,7 @@ main() {
   if [ -d "/var/lib/postgresql/${PG_VERSION}/main" ] && [ "$(readlink -f /var/lib/postgresql/${PG_VERSION}/main 2>/dev/null)" != "${DATA_DIR}" ]; then
     rsync -a /var/lib/postgresql/${PG_VERSION}/main/ "${DATA_DIR}/" > /dev/null 2>&1 || show_error "Copia dei dati PostgreSQL fallita"
   elif [ ! -f "${DATA_DIR}/PG_VERSION" ]; then
-    sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/initdb -D "${DATA_DIR}" > /dev/null 2>&1 || show_error "Initdb del nuovo data directory fallito"
+    sudo -u postgres /usr/lib/postgresql/${PG_VERSION}/bin/initdb --locale=it_IT.UTF-8 -D "${DATA_DIR}" > /dev/null 2>&1 || show_error "Initdb del nuovo data directory fallito"
   fi
 
   # Garantire che la directory appartenga a postgres
