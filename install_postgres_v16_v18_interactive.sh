@@ -212,7 +212,7 @@ main() {
   # 2. Installazione pacchetti necessari
   show_info "Installazione Pacchetti" "Installazione dei pacchetti richiesti..."
   apt update -y > /dev/null 2>&1 || show_error "Aggiornamento del sistema fallito"
-  apt install -y sudo rsync curl gnupg cron lsb-release gzip cloud-utils ncdu locales postgresql-common postgresql-client-common tzdata openssh-server > /dev/null 2>&1 || show_error "Installazione pacchetti di base fallita"
+  apt install -y sudo rsync curl gnupg cron lsb-release gzip cloud-utils ncdu net-tools locales postgresql-common postgresql-client-common tzdata openssh-server > /dev/null 2>&1 || show_error "Installazione pacchetti di base fallita"
   configure_timezone_and_ssh
   configure_locale
 
