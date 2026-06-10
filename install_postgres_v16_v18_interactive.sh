@@ -47,12 +47,43 @@ set_postgresql_conf() {
   fi
 }
 
-# Aggiunge una riga a pg_hba.conf solo se non esiste già
-ensure_pg_hba_line() {
-  local line="$1"
-  local file="$2"
+# Rileva le sottoreti IPv4 direttamente connesse (LAN locale + VPN ZeroTier),
+# escludendo loopback, link-local, Docker e bridge/virtuali interni.
+# Stampa una CIDR per riga (es. 192.168.20.0/24, 10.0.100.0/23).
+detect_pg_hba_subnets() {
+  ip -o -f inet route show scope link 2>/dev/null | while read -r net _ dev _; do
+    # Solo sottoreti in formato CIDR (scarta le rotte host singole, es. DHCP)
+    case "$net" in
+      */*) ;;
+      *) continue ;;
+    esac
+    case "$dev" in
+      lo|docker*|br-*|veth*|virbr*|cni*|flannel*|kube*|tap*|tun*) continue ;;
+    esac
+    case "$net" in
+      127.*|169.254.*) continue ;;
+    esac
+    echo "$net"
+  done | sort -u
+}
 
-  grep -Fqx "$line" "$file" || echo "$line" >> "$file"
+# Genera un pg_hba.conf pulito e leggibile: nessun commento tranne l'intestazione
+# delle colonne, autenticazione md5 ovunque (postgres locale compreso) e
+# autorizzazione automatica delle sottoreti LAN/ZeroTier rilevate.
+generate_pg_hba() {
+  local file="$1"
+  {
+    echo "# TYPE  DATABASE        USER            ADDRESS                 METHOD"
+    printf '%-8s%-16s%-16s%-24s%s\n' "local" "all" "postgres" "" "md5"
+    printf '%-8s%-16s%-16s%-24s%s\n' "local" "all" "all" "" "md5"
+    printf '%-8s%-16s%-16s%-24s%s\n' "host" "all" "all" "127.0.0.1/32" "md5"
+    printf '%-8s%-16s%-16s%-24s%s\n' "host" "all" "all" "::1/128" "md5"
+    detect_pg_hba_subnets | while read -r subnet; do
+      [ -n "$subnet" ] && printf '%-8s%-16s%-16s%-24s%s\n' "host" "all" "all" "$subnet" "md5"
+    done
+  } > "$file"
+  chown postgres:postgres "$file"
+  chmod 640 "$file"
 }
 
 configure_timezone_and_ssh() {
@@ -365,21 +396,12 @@ EOF
   # Ferma PostgreSQL prima di applicare la configurazione finale
   systemctl stop postgresql@"${PG_VERSION}-main" || true
 
-  # 12. Configurazione file pg_hba.conf (alla fine)
-  show_info "Aggiornamento pg_hba.conf" "Modifica configurazione accesso PostgreSQL..."
-
-  # Aggiunge configurazioni di rete
-  ensure_pg_hba_line "host    all     all     10.0.100.0/23    md5" "${CONF_DIR}/pg_hba.conf"
+  # 12. pg_hba.conf finale: file pulito (solo intestazione colonne), md5 ovunque
+  # — postgres locale compreso — e autorizzazione automatica delle sottoreti
+  # LAN locale e VPN ZeroTier rilevate sulla macchina.
+  show_info "Aggiornamento pg_hba.conf" "Generazione pg_hba.conf pulito (md5, sottoreti LAN/ZeroTier rilevate)..."
+  generate_pg_hba "${CONF_DIR}/pg_hba.conf"
   set_postgresql_conf "listen_addresses" "'*'" "${CONF_DIR}/postgresql.conf"
-
-  # Commenta le linee di replication
-  sed -i '/replication/ s/^/#/' "${CONF_DIR}/pg_hba.conf"
-
-  # Modifica metodi di autenticazione
-  sed -i '/^local[[:space:]]\+all[[:space:]]\+postgres[[:space:]]\+/ s/peer/md5/' "${CONF_DIR}/pg_hba.conf"
-  sed -i '/^local[[:space:]]\+all[[:space:]]\+postgres[[:space:]]\+/ s/ident/md5/' "${CONF_DIR}/pg_hba.conf"
-  sed -i '/127\.0\.0\.1/ s/ident/md5/' "${CONF_DIR}/pg_hba.conf"
-  sed -i '/::1/ s/ident/md5/' "${CONF_DIR}/pg_hba.conf"
 
   # 13. Configurazione personalizzata Zucchetti per PostgreSQL 16 e 18
   if [ "$PG_VERSION" = "16" ] || [ "$PG_VERSION" = "18" ]; then
