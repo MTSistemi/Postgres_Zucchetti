@@ -86,6 +86,124 @@ generate_pg_hba() {
   chmod 640 "$file"
 }
 
+# Genera zucchetti.conf con tuning DINAMICO calcolato su RAM e vCPU della macchina
+# (stile PGTune profilo OLTP/web) + parallelismo dinamico + ottimizzazioni
+# specifiche per gli applicativi Zucchetti (AGO / Presenze) e resilienza delle
+# connessioni su VPN ZeroTier.
+generate_zucchetti_conf() {
+  local conf_file="$1"
+  local RAM_MB CORES SHARED_BUFFERS EFFECTIVE_CACHE MAINT_WORK_MEM WORK_MEM_MB WAL_BUFFERS
+  local MAX_CONN MAX_WORKER_PROCESSES MAX_PARALLEL_WORKERS MAX_PARALLEL_PER_GATHER MAX_PARALLEL_MAINT
+  local MIN_WAL MAX_WAL AV_WORKERS
+
+  RAM_MB=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+  [ -n "$RAM_MB" ] && [ "$RAM_MB" -gt 0 ] 2>/dev/null || RAM_MB=4096
+  CORES=$(nproc 2>/dev/null || echo 2)
+  [ "$CORES" -ge 1 ] 2>/dev/null || CORES=1
+
+  # Connessioni: profilo Zucchetti multi-Tomcat (AGO + Presenze, più pool)
+  MAX_CONN=200
+
+  # Memoria (PGTune: 25% / 75% / RAM/16)
+  SHARED_BUFFERS=$((RAM_MB / 4))
+  EFFECTIVE_CACHE=$((RAM_MB * 3 / 4))
+  MAINT_WORK_MEM=$((RAM_MB / 16))
+  [ "$MAINT_WORK_MEM" -gt 2048 ] && MAINT_WORK_MEM=2048
+  [ "$MAINT_WORK_MEM" -lt 64 ] && MAINT_WORK_MEM=64
+  WAL_BUFFERS=$((SHARED_BUFFERS * 3 / 100))
+  [ "$WAL_BUFFERS" -gt 16 ] && WAL_BUFFERS=16
+  [ "$WAL_BUFFERS" -lt 4 ] && WAL_BUFFERS=4
+
+  # Parallelismo (dimensionato sui core)
+  MAX_WORKER_PROCESSES=$CORES
+  [ "$MAX_WORKER_PROCESSES" -lt 8 ] && MAX_WORKER_PROCESSES=8
+  MAX_PARALLEL_WORKERS=$CORES
+  MAX_PARALLEL_PER_GATHER=$((CORES / 2))
+  [ "$MAX_PARALLEL_PER_GATHER" -lt 1 ] && MAX_PARALLEL_PER_GATHER=1
+  [ "$MAX_PARALLEL_PER_GATHER" -gt 4 ] && MAX_PARALLEL_PER_GATHER=4
+  MAX_PARALLEL_MAINT=$((CORES / 2))
+  [ "$MAX_PARALLEL_MAINT" -lt 1 ] && MAX_PARALLEL_MAINT=1
+  [ "$MAX_PARALLEL_MAINT" -gt 4 ] && MAX_PARALLEL_MAINT=4
+
+  # work_mem = (RAM - shared_buffers) / (max_connections*3) / parallel_per_gather
+  WORK_MEM_MB=$(( (RAM_MB - SHARED_BUFFERS) / (MAX_CONN * 3 * MAX_PARALLEL_PER_GATHER) ))
+  [ "$WORK_MEM_MB" -lt 4 ] && WORK_MEM_MB=4
+
+  # WAL: più ampio su macchine con molta RAM
+  if [ "$RAM_MB" -ge 16384 ]; then MIN_WAL=2GB; MAX_WAL=8GB; else MIN_WAL=1GB; MAX_WAL=4GB; fi
+
+  # Autovacuum workers in base ai core
+  AV_WORKERS=$((CORES / 2))
+  [ "$AV_WORKERS" -lt 3 ] && AV_WORKERS=3
+  [ "$AV_WORKERS" -gt 8 ] && AV_WORKERS=8
+
+  cat > "$conf_file" <<EOF
+#-----------------------------------------------------------------------------
+# Tuning Zucchetti (AGO / Presenze) - generato DINAMICAMENTE in base all'hardware
+# RAM rilevata: ${RAM_MB} MB   |   vCPU rilevate: ${CORES}
+# Profilo: OLTP/web (PGTune) + parallelismo dinamico + compat applicativa Zucchetti
+#-----------------------------------------------------------------------------
+
+# --- Connessioni ---
+max_connections = ${MAX_CONN}
+
+# --- Memoria (dimensionata sulla RAM) ---
+shared_buffers = ${SHARED_BUFFERS}MB
+effective_cache_size = ${EFFECTIVE_CACHE}MB
+maintenance_work_mem = ${MAINT_WORK_MEM}MB
+work_mem = ${WORK_MEM_MB}MB
+wal_buffers = ${WAL_BUFFERS}MB
+
+# --- Pianificatore (storage SSD) ---
+random_page_cost = 1.1
+effective_io_concurrency = 200
+default_statistics_target = 1000
+
+# --- Parallelismo (dimensionato sui core) ---
+max_worker_processes = ${MAX_WORKER_PROCESSES}
+max_parallel_workers = ${MAX_PARALLEL_WORKERS}
+max_parallel_workers_per_gather = ${MAX_PARALLEL_PER_GATHER}
+max_parallel_maintenance_workers = ${MAX_PARALLEL_MAINT}
+
+# --- WAL / Checkpoint ---
+checkpoint_completion_target = 0.9
+min_wal_size = ${MIN_WAL}
+max_wal_size = ${MAX_WAL}
+wal_compression = on
+
+# --- Compatibilita' applicativa Zucchetti (AGO) ---
+escape_string_warning = on
+standard_conforming_strings = off
+max_locks_per_transaction = 1024
+
+# --- OLTP: query transazionali brevi (AGO / Presenze) ---
+jit = off
+
+# --- Resilienza connessioni su VPN ZeroTier (rileva connessioni morte) ---
+tcp_keepalives_idle = 60
+tcp_keepalives_interval = 10
+tcp_keepalives_count = 6
+
+# --- Logging ---
+log_destination = 'stderr'
+logging_collector = on
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+log_rotation_age = 1d
+log_rotation_size = 100MB
+
+# --- Autovacuum (più reattivo per workload OLTP Zucchetti) ---
+autovacuum = on
+autovacuum_max_workers = ${AV_WORKERS}
+autovacuum_naptime = 5s
+autovacuum_vacuum_scale_factor = 0.1
+autovacuum_analyze_scale_factor = 0.05
+autovacuum_vacuum_cost_delay = 2ms
+autovacuum_vacuum_cost_limit = 1000
+EOF
+  chown postgres:postgres "$conf_file"
+  chmod 640 "$conf_file"
+}
+
 configure_timezone_and_ssh() {
   show_info "Sistema" "Configurazione timezone ${TIMEZONE} e accesso SSH root/password..."
   if [ -f "/usr/share/zoneinfo/${TIMEZONE}" ]; then
@@ -403,64 +521,11 @@ EOF
   generate_pg_hba "${CONF_DIR}/pg_hba.conf"
   set_postgresql_conf "listen_addresses" "'*'" "${CONF_DIR}/postgresql.conf"
 
-  # 13. Configurazione personalizzata Zucchetti per PostgreSQL 16 e 18
+  # 13. Tuning Zucchetti dinamico (memoria + parallelismo) calcolato su RAM/vCPU
   if [ "$PG_VERSION" = "16" ] || [ "$PG_VERSION" = "18" ]; then
+    show_info "Tuning PostgreSQL" "Generazione tuning dinamico (RAM/vCPU) per AGO/Presenze..."
     set_postgresql_conf "include_if_exists" "'zucchetti.conf'" "${CONF_DIR}/postgresql.conf"
-
-    cat > "${CONF_DIR}/zucchetti.conf" <<'EOF'
-#-----------------------------------------------------------------------------
-# NOTE:
-#-----------------------------------------------------------------------------
-# Postgres ha un degrado di performance quando il numero di thread attivi
-# sono doppi o più rispetto al numero di core.
-# Nel caso in cui l'AUTOANALYZE (che ha maggiore priorità) occupi troppe
-# risorse, abbassare default_statistics_target.
-#-----------------------------------------------------------------------------
-# Fonte PGTUNE / Zucchetti - base generica da adattare all'hardware reale
-#-----------------------------------------------------------------------------
-max_connections = 100
-shared_buffers = 3584MB
-effective_cache_size = 10752MB
-maintenance_work_mem = 1434MB
-checkpoint_completion_target = 0.9
-wal_buffers = -1
-default_statistics_target = 1000
-random_page_cost = 1.1
-effective_io_concurrency = 200
-work_mem = 10MB
-min_wal_size = 1GB
-max_wal_size = 4GB
-max_locks_per_transaction = 1024
-escape_string_warning = on
-standard_conforming_strings = off
-
-#-----------------------------------------------------------------------------
-# LOGGER
-#-----------------------------------------------------------------------------
-log_destination = 'stderr'
-logging_collector = on
-log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
-log_rotation_age = 1d
-log_rotation_size = 100MB
-
-#-----------------------------------------------------------------------------
-# AUTOVACUUM
-#-----------------------------------------------------------------------------
-autovacuum = on
-autovacuum_analyze_scale_factor = 0.1
-autovacuum_analyze_threshold = 500
-autovacuum_freeze_max_age = 200000000
-autovacuum_max_workers = 3
-autovacuum_multixact_freeze_max_age = 400000000
-autovacuum_naptime = 5s
-autovacuum_vacuum_cost_delay = 20ms
-autovacuum_vacuum_cost_limit = -1
-autovacuum_vacuum_scale_factor = 0.2
-autovacuum_vacuum_threshold = 1500
-autovacuum_work_mem = -1
-EOF
-
-    chown postgres:postgres "${CONF_DIR}/zucchetti.conf"
+    generate_zucchetti_conf "${CONF_DIR}/zucchetti.conf"
   fi
 
   # 14. Riavvio servizio PostgreSQL
